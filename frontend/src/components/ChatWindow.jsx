@@ -2,6 +2,7 @@ import React, { useContext, useState } from 'react';
 import { UserContext } from '../context/UserContext';
 import { chatsAPI } from '../services/api';
 import SearchBar from './SearchBar';
+import ReactMarkdown from 'react-markdown';
 
 export default function ChatWindow() {
   const { activeChat, setActiveChat, setChats } = useContext(UserContext);
@@ -21,18 +22,13 @@ export default function ChatWindow() {
     // Optimistically update local active chat state before hitting server
     const localUserMsg = { role: 'user', content: userMessageText, timestamp: new Date().toISOString() };
     const updatedMessages = [...activeChat.messages, localUserMsg];
-    
     setActiveChat({ ...activeChat, messages: updatedMessages });
 
     try {
-      // Send user message to database
-      await chatsAPI.sendMessage(activeChat.id, 'user', userMessageText);
+      // Pass only the user message. Your backend handles the rest!
+      const finalMessages = await chatsAPI.sendMessage(activeChat.id, 'user', userMessageText);
 
-      // Simple echo simulation for Phase 1 verification
-      const assistantReplyText = `Echoing: "${userMessageText}". Data systems verified!`;
-      const finalMessages = await chatsAPI.sendMessage(activeChat.id, 'assistant', assistantReplyText);
-
-      // Sync backend updated list with context
+      // Sync the full, updated message history from the backend straight into state
       const updatedChatObj = { ...activeChat, messages: finalMessages };
       setActiveChat(updatedChatObj);
       setChats((prev) => prev.map(c => c.id === activeChat.id ? updatedChatObj : c));
@@ -84,7 +80,14 @@ export default function ChatWindow() {
         {activeChat.messages.map((msg, index) => (
           <div key={index} style={{ marginBottom: '1rem', padding: '0.5rem', background: msg.role === 'user' ? 'transparent' : '#444654', borderRadius: '4px' }}>
             <strong>{msg.role === 'user' ? 'You' : 'Assistant'}:</strong>
-            <p style={{ margin: '4px 0 0 0' }}>{msg.content}</p>
+            
+            {msg.role === 'user' ? (
+              <p style={{ margin: '4px 0 0 0', whiteSpace: 'pre-wrap' }}>{msg.content}</p>
+            ) : (
+              <div style={{ margin: '4px 0 0 0', lineHeight: '1.6' }}>
+                <ReactMarkdown>{msg.content}</ReactMarkdown>
+              </div>
+            )}
           </div>
         ))}
       </div>
