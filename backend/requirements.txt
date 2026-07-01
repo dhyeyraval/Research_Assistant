@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pymongo
+motor
+google-genai
+pydantic
+python-dotenv
+pypdf
+httpx
+pinecone
