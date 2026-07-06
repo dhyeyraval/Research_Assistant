@@ -5,6 +5,8 @@ from typing import List
 from google import genai
 from google.genai import types
 
+import asyncio
+
 from app.config import GEMINI_API_KEY
 from app.database.mongo import get_database
 from app.database.vector import get_vector_index
@@ -53,92 +55,107 @@ async def get_user_chats(user_id: str, db=Depends(get_database)):
         ))
     return chats
 
-# 3. Add a message to an existing conversation
+# 3. Add a message to an existing conversation (Hybrid RAG + File API)
 @router.post("/{chat_id}/message", response_model=List[Message])
 async def add_message_to_chat(chat_id: str, message: Message, db=Depends(get_database)):
     if not ObjectId.is_valid(chat_id):
         raise HTTPException(status_code=400, detail="Invalid chat ID format")
-    
-    # Step 1: Fetch the current chat state to see what papers are attached
+        
     chat = await db.chats.find_one({"_id": ObjectId(chat_id)})
     if not chat:
         raise HTTPException(status_code=404, detail="Chat conversation not found")
         
-    attached_papers = chat.get("attached_papers", [])
-    arxiv_ids = [p["arxiv_id"] for p in attached_papers]
+    arxiv_ids = [p["arxiv_id"] for p in chat.get("attached_papers", [])]
     
-    context_text = ""
+    rag_ids = []
+    gemini_file_names = []
+    
+    # THE CAP (n): Maximum number of papers to process via direct File API
+    MAX_DIRECT_FILES = 2 
 
-    # Step 2: If papers are attached, query Pinecone for relevant context
     if arxiv_ids:
+        # --- THE SMART WAITING LOOP ---
+        while True:
+            cursor = db.papers.find({"arxiv_id": {"$in": arxiv_ids}})
+            paper_docs = await cursor.to_list(length=None)
+            
+            # Count papers that haven't even hit the database yet
+            found_ids = {doc["arxiv_id"] for doc in paper_docs}
+            missing_count = len(arxiv_ids) - len(found_ids)
+            
+            # Pending means it's either downloading or uploaded to File API but RAG isn't done
+            pending_docs = [doc for doc in paper_docs if doc.get("status") != "completed"]
+            total_pending = len(pending_docs) + missing_count
+            
+            # Check if any pending papers are still downloading (no gemini_file_name yet)
+            unready_pending = [doc for doc in pending_docs if not doc.get("gemini_file_name")]
+            
+            # Logic: If total pending is <= n, AND all of those pending files 
+            # have successfully uploaded to Gemini API, we can break the loop!
+            if total_pending <= MAX_DIRECT_FILES and len(unready_pending) == 0 and missing_count == 0:
+                for doc in paper_docs:
+                    if doc.get("status") == "completed":
+                        rag_ids.append(doc["arxiv_id"])
+                    elif doc.get("gemini_file_name"):
+                        gemini_file_names.append(doc["gemini_file_name"])
+                break
+                
+            # If > n papers are pending, or files are still downloading, wait 2 seconds.
+            # (Your frontend will just show a loading spinner during this time)
+            await asyncio.sleep(2)
+            
+    # --- ASSEMBLE HYBRID CONTEXT ---
+    gemini_contents = []
+    
+    # 1. Fetch RAG Context for completed papers (Using ASYNC Embed)
+    context_text = ""
+    if rag_ids:
         try:
-            # Create a 768-dimensional embedding from the user's question
-            embedding_response = ai_client.models.embed_content(
+            embedding_response = await ai_client.aio.models.embed_content(
                 model='gemini-embedding-001',
                 contents=message.content,
                 config=types.EmbedContentConfig(output_dimensionality=768)
             )
-            query_vector = embedding_response.embeddings[0].values
-            
-            # Query Pinecone using a metadata filter limited to this chat's attached papers
-            index = get_vector_index()
-            pinecone_response = index.query(
-                vector=query_vector,
+            pinecone_response = get_vector_index().query(
+                vector=embedding_response.embeddings[0].values,
                 top_k=5,
                 include_metadata=True,
-                filter={"arxiv_id": {"$in": arxiv_ids}}
+                filter={"arxiv_id": {"$in": rag_ids}}
             )
-            
-            # Extract and stitch text chunks together
-            chunks = [
-                match["metadata"]["text"] 
-                for match in pinecone_response.get("matches", []) 
-                if "metadata" in match and "text" in match["metadata"]
-            ]
+            chunks = [m["metadata"]["text"] for m in pinecone_response.get("matches", []) if "text" in m.get("metadata", {})]
             context_text = "\n\n".join(chunks)
         except Exception as e:
-            print(f"Vector search failed: {str(e)}. Proceeding with fallback general generation.")
+            print(f"Vector search failed: {str(e)}")
 
-    # Step 3: Construct the context-infused prompt for Gemini
     if context_text:
-        system_instruction = (
+        gemini_contents.append(
             "You are an expert research assistant. Answer the user's question using the provided relevant text chunks "
-            "extracted from the attached research papers. If the answer cannot be found completely in the context, use your "
-            "general technical knowledge to fill gaps but clearly specify what came from the papers versus general knowledge.\n\n"
-            f"--- RELEVANT PAPER CONTEXT ---\n{context_text}\n---------------------------"
+            f"extracted from the attached research papers.\n\n--- RELEVANT PAPER CONTEXT ---\n{context_text}\n---------------------------"
         )
     else:
-        system_instruction = (
-            "You are an expert research assistant. Note: There are currently no research papers attached to this specific "
-            "conversation, so please answer the user's question using your overall knowledge base."
-        )
+        gemini_contents.append("You are an expert research assistant. Answer the user's question using the attached files.")
 
-    # Step 4: Generate the reply using Gemini 2.5 Flash
+    # 2. Add the User's Message
+    gemini_contents.append(f"User Question: {message.content}")
+
+    # 3. Add Raw File API Objects for pending papers (Using ASYNC Get)
+    for file_name in gemini_file_names:
+        try:
+            f = await ai_client.aio.files.get(name=file_name)
+            gemini_contents.append(f)
+        except Exception as e:
+            print(f"Could not load file {file_name}: {e}")
+
+    # --- GENERATE & SAVE RESPONSE (Using ASYNC Generate) ---
     try:
-        gemini_response = ai_client.models.generate_content(
+        gemini_response = await ai_client.aio.models.generate_content(
             model='gemini-2.5-flash',
-            contents=f"{system_instruction}\n\nUser Question: {message.content}"
+            contents=gemini_contents
         )
         assistant_reply = gemini_response.text
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI Generation failed: {str(e)}")
-        
-    # # Convert the incoming message to a dictionary for MongoDB storage
-    # message_dict = message.model_dump()
-    # message_dict["timestamp"] = datetime.now()
-    
-    # result = await db.chats.find_one_and_update(
-    #     {"_id": ObjectId(chat_id)},
-    #     {"$push": {"messages": message_dict}},
-    #     return_document=True
-    # )
-    
-    # if not result:
-    #     raise HTTPException(status_code=404, detail="Chat conversation not found")
-        
-    # return [Message(**m) for m in result["messages"]]
 
-    # Step 5: Format both messages and atomically push them to MongoDB
     user_message_dict = message.model_dump()
     user_message_dict["timestamp"] = datetime.utcnow()
     

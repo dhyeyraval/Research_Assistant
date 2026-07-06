@@ -3,6 +3,7 @@ import httpx
 import tempfile
 import pypdf
 import uuid
+import asyncio
 from google import genai
 from google.genai import types
 
@@ -27,74 +28,77 @@ async def process_and_ingest_paper(arxiv_id: str, title: str, abstract: str, aut
     db = get_database()
     index = get_vector_index()
     
-    # 1. Deduplication Check
     existing_paper = await db.papers.find_one({"arxiv_id": arxiv_id})
-    if existing_paper:
-        print(f"Paper {arxiv_id} already exists in Vector DB. Skipping ingestion.")
+    if existing_paper and existing_paper.get("status") == "completed":
+        print(f"Paper {arxiv_id} already fully ingested. Skipping.")
         return True
 
-    print(f"Starting ingestion for {arxiv_id}...")
+    print(f"Starting hybrid ingestion for {arxiv_id}...")
+    
+    await db.papers.update_one(
+        {"arxiv_id": arxiv_id},
+        {"$set": {"status": "downloading", "title": title, "authors": authors}},
+        upsert=True
+    )
+
     pdf_url = f"https://export.arxiv.org/pdf/{arxiv_id}"
     
-    # Create a temporary file to hold the PDF
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
         tmp_path = tmp_file.name
 
     try:
-        # 2. Download the PDF
         async with httpx.AsyncClient(follow_redirects=True) as http_client:
             response = await http_client.get(pdf_url, timeout=30.0)
             response.raise_for_status()
             with open(tmp_path, "wb") as f:
                 f.write(response.content)
 
-        # 3. Extract standard text using PyPDF2
-        full_text = ""
-        with open(tmp_path, "rb") as f:
-            reader = pypdf.PdfReader(f)
-            for page in reader.pages:
-                text = page.extract_text()
-                if text:
-                    full_text += text + "\n"
+        # 3. ASYNC Upload to Gemini
+        print("Uploading PDF to Gemini File API for hybrid access...")
+        uploaded_file = await ai_client.aio.files.upload(file=tmp_path)
+        
+        await db.papers.update_one(
+            {"arxiv_id": arxiv_id},
+            {"$set": {"status": "pending", "gemini_file_name": uploaded_file.name}}
+        )
 
-        # 4. Extract visual summaries using Gemini File API
-        print("Uploading PDF to Gemini for visual analysis...")
-        uploaded_file = ai_client.files.upload(file=tmp_path)
+        # 4. CPU-Offloaded Text Extraction (prevents server freezing)
+        def extract_text_sync(path):
+            text = ""
+            with open(path, "rb") as f:
+                reader = pypdf.PdfReader(f)
+                for page in reader.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+            return text
+
+        full_text = await asyncio.to_thread(extract_text_sync, tmp_path)
+
+        # 5. ASYNC Visual Extraction
+        print("Generating visual summaries...")
+        prompt = "Analyze this research paper. Identify all figures, graphs, and tables. For each one, write a detailed summary. If there are no figures, output 'No visual data found.'"
         
-        prompt = """
-        Analyze this research paper. Identify all figures, graphs, and tables. 
-        For each one, write a highly detailed text summary describing the data, trends, axes, and key takeaways. 
-        If there are no figures or tables, simply output 'No visual data found.'
-        """
-        
-        vision_response = ai_client.models.generate_content(
-            model='gemini-2.5-flash', # We use Flash for fast, cheap visual parsing
+        vision_response = await ai_client.aio.models.generate_content(
+            model='gemini-2.5-flash',
             contents=[uploaded_file, prompt]
         )
-        visual_summaries = vision_response.text
-
-        # 5. Chunk and Combine Data
-        print("Chunking text and generating embeddings...")
+        
+        # 6. Chunking and ASYNC Embedding
         text_chunks = chunk_text(full_text)
-        if "No visual data found" not in visual_summaries:
-            text_chunks.append(f"VISUAL DATA SUMMARIES:\n{visual_summaries}")
+        if "No visual data found" not in vision_response.text:
+            text_chunks.append(f"VISUAL DATA SUMMARIES:\n{vision_response.text}")
 
-        # 6. Embed and Upload to Pinecone in batches
         vectors_to_upsert = []
         for i, chunk in enumerate(text_chunks):
-            # Generate 768-dimensional embedding
-            embedding_response = ai_client.models.embed_content(
+            embedding_response = await ai_client.aio.models.embed_content(
                 model='gemini-embedding-001',
                 contents=chunk,
                 config=types.EmbedContentConfig(output_dimensionality=768)
             )
             
             vector_id = f"{arxiv_id}-chunk-{i}"
-            metadata = {
-                "arxiv_id": arxiv_id,
-                "text": chunk,
-                "type": "figure_summary" if i == len(text_chunks)-1 else "text"
-            }
+            metadata = {"arxiv_id": arxiv_id, "text": chunk}
             
             vectors_to_upsert.append({
                 "id": vector_id,
@@ -102,24 +106,18 @@ async def process_and_ingest_paper(arxiv_id: str, title: str, abstract: str, aut
                 "metadata": metadata
             })
 
-            # Upload in batches of 50 to avoid payload limits
             if len(vectors_to_upsert) >= 50:
                 index.upsert(vectors=vectors_to_upsert)
                 vectors_to_upsert = []
                 
-        # Upload any remaining vectors
         if vectors_to_upsert:
             index.upsert(vectors=vectors_to_upsert)
 
-        # 7. Save to MongoDB
-        await db.papers.insert_one({
-            "arxiv_id": arxiv_id,
-            "title": title,
-            "authors": authors,
-            "abstract": abstract,
-            "ingested_at": os.time() if hasattr(os, 'time') else None # Optional timestamp
-        })
-        print(f"Successfully ingested {arxiv_id}!")
+        await db.papers.update_one(
+            {"arxiv_id": arxiv_id},
+            {"$set": {"status": "completed"}}
+        )
+        print(f"Successfully finished Pinecone RAG ingestion for {arxiv_id}!")
         return True
 
     except Exception as e:
@@ -127,10 +125,5 @@ async def process_and_ingest_paper(arxiv_id: str, title: str, abstract: str, aut
         raise e
         
     finally:
-        # Cleanup temp file and Gemini cloud file
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-        try:
-            ai_client.files.delete(name=uploaded_file.name)
-        except:
-            pass
