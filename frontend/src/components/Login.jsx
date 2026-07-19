@@ -23,19 +23,19 @@ export default function Login() {
   };
 
   return (
-    <div style={{ display: 'flex', height: '100vh', alignItems: 'center', justifyContent: 'center', background: '#f5f5f5' }}>
-      <form onSubmit={handleSubmit} style={{ background: '#fff', padding: '2rem', borderRadius: '8px', boxShadow: '0 4px 12px rgba(0,0,0,0.1)', width: '320px' }}>
-        <h3>Research Assistant</h3>
-        <label style={{ display: 'block', marginBottom: '0.5rem' }}>Enter Username</label>
+    <div style={{ display: 'flex', height: '100vh', alignItems: 'center', justifyContent: 'center', background: '#343541', color: '#ececf1' }}>
+      <form onSubmit={handleSubmit} style={{ background: '#202123', padding: '2rem', borderRadius: '8px', border: '1px solid #4d4d4f', boxShadow: '0 8px 24px rgba(0,0,0,0.35)', width: '320px' }}>
+        <h3 style={{ marginTop: 0, marginBottom: '1rem', color: '#ececf1' }}>Research Assistant</h3>
+        <label style={{ display: 'block', marginBottom: '0.5rem', color: '#aaa' }}>Enter Username</label>
         <input 
           type="text" 
           value={username} 
           onChange={(e) => setUsername(e.target.value)}
           placeholder="e.g., researcher_1" 
-          style={{ width: '100%', padding: '0.5rem', marginBottom: '1rem', boxSizing: 'border-box' }}
+          style={{ width: '100%', padding: '0.65rem', marginBottom: '1rem', boxSizing: 'border-box', background: '#40414F', border: '1px solid #565869', color: '#fff', borderRadius: '4px' }}
           required 
         />
-        <button type="submit" disabled={loading} style={{ width: '100%', padding: '0.5rem', cursor: 'pointer' }}>
+        <button type="submit" disabled={loading} style={{ width: '100%', padding: '0.65rem', cursor: 'pointer', background: '#40414F', border: '1px solid #565869', color: '#ececf1', borderRadius: '4px' }}>
           {loading ? 'Entering...' : 'Enter App'}
         </button>
       </form>

@@ -6,6 +6,7 @@ from google import genai
 from google.genai import types
 
 import asyncio
+import time
 
 from app.config import GEMINI_API_KEY
 from app.database.mongo import get_database
@@ -58,6 +59,8 @@ async def get_user_chats(user_id: str, db=Depends(get_database)):
 # 3. Add a message to an existing conversation (Hybrid RAG + File API)
 @router.post("/{chat_id}/message", response_model=List[Message])
 async def add_message_to_chat(chat_id: str, message: Message, db=Depends(get_database)):
+    start_time = time.perf_counter() # Start timing for performance monitoring
+
     if not ObjectId.is_valid(chat_id):
         raise HTTPException(status_code=400, detail="Invalid chat ID format")
         
@@ -170,5 +173,9 @@ async def add_message_to_chat(chat_id: str, message: Message, db=Depends(get_dat
         {"$push": {"messages": {"$each": [user_message_dict, assistant_message_dict]}}},
         return_document=True
     )
+
+    end_time = time.perf_counter() # End timing for performance monitoring
+    execution_time = end_time - start_time
+    print(f"Response time = {execution_time} seconds")
         
     return [Message(**m) for m in result["messages"]]
